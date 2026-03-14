@@ -2,7 +2,9 @@ package main
 
 // 17890
 
-import "ReMochi/TCPServer"
+import (
+	"ReMochi/internal/TCPServer"
+)
 
 func main() {
 	TCPServer.StartTCPServer()

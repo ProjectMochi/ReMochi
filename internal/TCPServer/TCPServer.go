@@ -1,21 +1,17 @@
 package TCPServer
 
 import (
+	"ReMochi/internal/UUID2IP"
+	"ReMochi/internal/protocol"
 	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
 	"time"
-
-	// 假设你的 protocol 包在这个路径，请根据实际项目结构调整
-	// "ReMochi/protocol"
-	// 由于我无法直接修改你的本地 import，这里假设 protocol 包已正确引入
-	// 如果编译报错，请确保 protocol 包包含 Beat, Message, Auth, Note 结构体及对应的 FromJSON/ToJSON 方法
-	"ReMochi/protocol"
 )
 
-const listenPort = "17890" // 修改为示例中的 8888
+const listenPort = "17890"
 
 func StartTCPServer() {
 	listener, err := net.Listen("tcp", ":"+listenPort)
@@ -23,7 +19,12 @@ func StartTCPServer() {
 		fmt.Printf("启动TCP服务失败: %v\n", err)
 		return
 	}
-	defer listener.Close()
+	defer func(listener net.Listener) {
+		err := listener.Close()
+		if err != nil {
+
+		}
+	}(listener)
 
 	fmt.Printf("TCP服务已启动，监听端口: %s\n", listenPort)
 
@@ -49,6 +50,10 @@ func handleClient(conn net.Conn) {
 	fmt.Printf("客户端[%s]已连接\n", clientAddr)
 	reader := bufio.NewReader(conn)
 
+	// 强制首次认证检查
+	isAuthenticated := false
+	uuid := ""
+
 	for {
 		data, err := reader.ReadString('\n')
 		if err != nil {
@@ -73,14 +78,40 @@ func handleClient(conn net.Conn) {
 			continue
 		}
 
-		// 2. 分发处理
+		// 检查是否已认证
+		if !isAuthenticated {
+			// 如果不是认证请求，则拒绝处理其他请求
+			if baseReq.Op != "auth" {
+				sendErrorNote(conn, "0010", "未授权：必须先进行身份验证")
+				continue
+			}
+
+			// 处理认证请求
+			authResult, authUUID := handleAuthRequest(conn, reqData)
+			if authResult {
+				isAuthenticated = true
+				uuid = authUUID
+				fmt.Printf("客户端[%s]认证成功，UUID: %s\n", clientAddr, uuid)
+			} else {
+				// 认证失败，继续等待认证或关闭连接
+				fmt.Printf("客户端[%s]认证失败\n", clientAddr)
+				continue
+			}
+		} else {
+			// 已认证的情况下，检查UUID是否仍然有效
+			storedIP, exists := UUID2IP.GetGlobalMap().GetIPByUUID(uuid)
+			if !exists || storedIP != clientAddr {
+				sendErrorNote(conn, "0011", "会话失效：UUID与IP不匹配")
+				return
+			}
+		}
+
+		// 2. 分发处理（仅在认证后允许）
 		switch baseReq.Op {
 		case "Beat", "Ping", "Pong":
 			handleBeatRequest(conn, reqData)
 		case "Message":
-			handleMessageRequest(conn, reqData)
-		case "auth":
-			handleAuthRequest(conn, reqData)
+			handleMessageRequest(conn, reqData, uuid)
 		default:
 			sendErrorNote(conn, "0002", fmt.Sprintf("不支持的op类型: %s", baseReq.Op))
 		}
@@ -88,7 +119,7 @@ func handleClient(conn net.Conn) {
 }
 
 // 处理 Beat/Ping/Pong 请求
-// 核心逻辑：原样回显客户端的时间戳，让客户端计算延迟
+// 原样回显客户端的时间戳，让客户端计算延迟
 func handleBeatRequest(conn net.Conn, reqData string) {
 	beatReq, err := protocol.BeatFromJSON([]byte(reqData))
 	if err != nil {
@@ -97,18 +128,18 @@ func handleBeatRequest(conn net.Conn, reqData string) {
 	}
 
 	// 构建响应
-	// 关键点：Timestamp 直接使用 beatReq.Payload.Timestamp，不要换成 time.Now()
+	// Timestamp 直接使用 beatReq.Payload.Timestamp
 	beatResp := &protocol.Beat{
-		Op: "Pong", // 通常 Ping 回复 Pong，Beat 回复 Beat 或 Pong，视协议约定而定
+		Op: "Pong", // 通常 Ping 回复 Pong，Beat 回复 Beat 或 Pong
 		Payload: protocol.BeatPayload{
 			Version:   beatReq.Payload.Version,   // 回显版本
-			Timestamp: beatReq.Payload.Timestamp, // <--- 关键：原样回显客户端时间戳
+			Timestamp: beatReq.Payload.Timestamp, // 原样回显客户端时间戳
 			Status:    "success",
 			Delay:     0, // 服务器不计算单向延迟，留给客户端算 RTT
 		},
 	}
 
-	// 如果是 Beat 请求，有些协议约定回 "Beat"，有些回 "Pong"，这里根据需求可调整
+	// 如果是 Beat 请求，有些协议约定回 "Beat"，有些回 "Pong"
 	if beatReq.Op == "Beat" {
 		beatResp.Op = "Beat"
 	}
@@ -117,12 +148,42 @@ func handleBeatRequest(conn net.Conn, reqData string) {
 }
 
 // 处理 Message 请求
-func handleMessageRequest(conn net.Conn, reqData string) {
+func handleMessageRequest(conn net.Conn, reqData string, senderUUID string) {
 	msgReq, err := protocol.MessageFromJSON([]byte(reqData))
 	if err != nil {
 		sendErrorNote(conn, "0005", "Message请求解析失败")
 		return
 	}
+
+	// 验证消息发送者是否与认证UUID一致
+	if msgReq.Payload.Form != senderUUID {
+		sendErrorNote(conn, "0012", "消息验证失败：发送者UUID与认证UUID不匹配")
+		return
+	}
+
+	// 从Message的To字段获取目标UUID
+	targetUUID := msgReq.Payload.To
+	// 根据UUID查找目标IP
+	targetIP, exists := UUID2IP.GetGlobalMap().GetIPByUUID(targetUUID)
+	if !exists {
+		fmt.Printf("转发失败：未找到UUID[%s]对应的IP\n", targetUUID)
+		// 可选：给发送方返回转发失败的错误
+		errorNote := &protocol.Note{
+			Op: "Notes",
+			Payload: protocol.NotePayload{
+				Type:      "error",
+				Code:      "0009",
+				Timestamp: time.Now().UnixMilli(),
+			},
+		}
+		sendResponse(conn, errorNote)
+		return
+	}
+
+	// Now 模拟转发
+	fmt.Printf("准备转发消息到 UUID[%s] → IP[%s]，消息内容：%s\n",
+		targetUUID, targetIP, msgReq.Payload.Content)
+	// TODO: finish
 
 	// 构建 ACK 响应
 	ackNote := &protocol.Note{
@@ -137,43 +198,45 @@ func handleMessageRequest(conn net.Conn, reqData string) {
 	sendResponse(conn, ackNote)
 }
 
-// 处理 Auth 请求
-func handleAuthRequest(conn net.Conn, reqData string) {
+// 处理 Auth 请求 - 返回认证结果和UUID
+func handleAuthRequest(conn net.Conn, reqData string) (bool, string) {
 	authReq, err := protocol.AuthFromJSON([]byte(reqData))
 	if err != nil {
 		sendErrorNote(conn, "0007", "Auth请求解析失败")
-		return
+		return false, ""
 	}
 
 	// 简单鉴权逻辑
 	if authReq.Payload.ID == "" || authReq.Payload.Token == "" {
 		sendErrorNote(conn, "0008", "鉴权失败：ID或Token为空")
-		return
+		return false, ""
 	}
 
-	// 鉴权成功
+	clientIP := UUID2IP.GetIPFromConn(conn) // 获取客户端IP（带端口）
+	// 存入全局映射表：Key=鉴权ID(UUID)，Value=客户端IP
+	UUID2IP.GetGlobalMap().Set(authReq.Payload.ID, clientIP)
+	fmt.Printf("已绑定 UUID[%s] ↔ IP[%s]\n", authReq.Payload.ID, clientIP)
+
+	// 鉴权成功响应
 	successNote := &protocol.Note{
 		Op: "Notes",
 		Payload: protocol.NotePayload{
 			Type:      "ack",
 			Code:      "0000",
-			Timestamp: time.Now().UnixMilli(), // 回显请求时间戳
+			Timestamp: time.Now().UnixMilli(),
 		},
 	}
 
 	sendResponse(conn, successNote)
 	fmt.Printf("客户端[%s]鉴权成功\n", conn.RemoteAddr())
+
+	return true, authReq.Payload.ID
 }
 
 // 通用发送响应函数 (支持泛型或接口，这里简化为直接写入 JSON)
-// 注意：这里假设 beatResp, note 等结构体都有 ToJSON 方法
 func sendResponse(conn net.Conn, data interface{}) {
 	var jsonData []byte
 	var err error
-
-	// 尝试调用 ToJSON 方法 (需要 type assertion 或者接口约束，这里写死逻辑适配你的 protocol 包)
-	// 由于 Go 是静态类型，这里需要根据传入类型分别处理，或者 protocol 包实现了统一接口
-	// 假设你的 protocol 包结构体都有 ToJSON() ([]byte, error) 方法
 
 	switch v := data.(type) {
 	case *protocol.Beat:
@@ -205,14 +268,8 @@ func sendErrorNote(conn net.Conn, code, msg string) {
 			Type:      "error",
 			Code:      code,
 			Timestamp: time.Now().UnixMilli(), // 错误时间用服务器时间即可
-			// 如果需要，可以把 msg 放入某个字段，但根据你的 Note 结构似乎只有 type/code/timestamp
-			// 如果 protocol.NotePayload 有 Message 字段，可以加上
 		},
 	}
-
-	// 注意：你的 Note 结构体定义里似乎没有直接存 msg 的字段？
-	// 如果有，建议加上。如果没有，通常 Code 就代表了错误含义。
-	// 这里为了演示，假设 Code 足够，或者你需要修改 protocol 包增加 Message 字段。
 
 	jsonData, err := errorNote.ToJSON()
 	if err != nil {
