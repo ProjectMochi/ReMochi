@@ -1,0 +1,1 @@
+{"op": "Message", "payload": {"id": "<UUID>", "form": "<Form-UUID>", "to": "<To-UUID>", "type": "Text/Image/System", "content": "1234567890", "timestamp": 1}}

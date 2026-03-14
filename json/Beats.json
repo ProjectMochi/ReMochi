@@ -1,0 +1,1 @@
+{"op": "Beat/Ping/Pong", "payload": {"version": [X, Y, Z], "timestamp": 1, "status": "active", "delay": 0}}

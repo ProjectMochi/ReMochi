@@ -1,0 +1,1 @@
+{"op" : "auth", "payload": {"id" : "<UUID>", "token" : "<token>"}}
