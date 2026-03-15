@@ -59,6 +59,19 @@ class TCPTestClient:
             self.socket.settimeout(timeout)
             response = self.socket.recv(4096).decode('utf-8').strip()
             print(f"接收: {response}")
+            
+            # 检查是否是消息
+            if response and '"op":"Message"' in response:
+                try:
+                    msg_data = json.loads(response)
+                    if 'payload' in msg_data and 'id' in msg_data['payload']:
+                        message_id = msg_data['payload']['id']
+                        print(f"收到消息，ID: {message_id}")
+                        # 发送消息确认
+                        self.send_message_ack(message_id)
+                except json.JSONDecodeError:
+                    print("解析消息失败")
+            
             return response
         except socket.timeout:
             print("接收超时")
@@ -66,6 +79,27 @@ class TCPTestClient:
         except Exception as e:
             print(f"接收失败: {e}")
             return None
+            
+    def send_message_ack(self, message_id):
+        """发送消息确认"""
+        if not self.connected:
+            print("未连接到服务器")
+            return False
+
+        try:
+            ack_request = {
+                "op": "MessageAck",
+                "payload": {
+                    "message_id": message_id
+                }
+            }
+            
+            self.send_message(json.dumps(ack_request))
+            print(f"发送消息确认: {message_id}")
+            return True
+        except Exception as e:
+            print(f"发送消息确认失败: {e}")
+            return False
 
     def authenticate(self, user_id=None, token="test_token"):
         """执行认证"""
@@ -273,12 +307,128 @@ def test_message_forwarding():
         print(f"\n客户端1向客户端2({user2_uuid})发送消息...")
         message_response = client1.send_message_to_user(user2_uuid, "Hello from Client1!", user1_uuid)
         print(f"客户端1收到响应: {message_response}")
+        
+        # 等待一段时间，以便接收和处理消息
+        print("\n等待消息处理...")
+        time.sleep(2)
+        
+        # 客户端2尝试接收消息
+        print("\n客户端2尝试接收消息...")
+        client2_response = client2.receive_message()
+        print(f"客户端2收到: {client2_response}")
 
     # 断开连接
     if client1.connected:
         client1.disconnect()
     if client2.connected:
         client2.disconnect()
+
+def test_offline_message_forwarding():
+    """测试接收方临时不在线时的消息转发处理"""
+    print("\n=== 测试接收方临时不在线的消息转发 ===")
+
+    # 步骤1: B先上线注册IP
+    print("\n步骤1: B先上线注册IP...")
+    client_b = TCPTestClient()
+    if client_b.connect():
+        user_b_uuid = f"userB_{str(uuid.uuid4())[:8]}"
+        print(f"B的UUID: {user_b_uuid}")
+        
+        # B进行认证
+        auth_response_b = client_b.authenticate(user_b_uuid)
+        if auth_response_b and '"code":"0000"' in auth_response_b:
+            print("✓ B认证成功，已注册IP")
+        else:
+            print("✗ B认证失败")
+            client_b.disconnect()
+            return
+        
+        # 步骤2: B马上下线
+        print("\n步骤2: B马上下线...")
+        client_b.disconnect()
+        print("✓ B已下线")
+    else:
+        print("✗ B连接失败")
+        return
+
+    # 步骤3: A上线并向B发送消息
+    print("\n步骤3: A上线并向B发送消息...")
+    client_a = TCPTestClient()
+    if client_a.connect():
+        user_a_uuid = f"userA_{str(uuid.uuid4())[:8]}"
+        print(f"A的UUID: {user_a_uuid}")
+        
+        # A进行认证
+        auth_response_a = client_a.authenticate(user_a_uuid)
+        if auth_response_a and '"code":"0000"' in auth_response_a:
+            print("✓ A认证成功")
+            
+            # A向B发送消息
+            print(f"\nA向离线的B({user_b_uuid})发送消息...")
+            message_content = f"Hello from A! Time: {time.strftime('%H:%M:%S')}"
+            message_response = client_a.send_message_to_user(user_b_uuid, message_content, user_a_uuid)
+            print(f"A收到响应: {message_response}")
+            
+            # A保持在线，等待B重新上线
+            print("\nA保持在线，等待B重新上线...")
+        else:
+            print("✗ A认证失败")
+            client_a.disconnect()
+            return
+    else:
+        print("✗ A连接失败")
+        return
+
+    # 步骤4: 等待一段时间（模拟B离线期间）
+    wait_time = 5  # 等待5秒，模拟B离线
+    print(f"\n步骤4: 等待{wait_time}秒（模拟B离线期间）...")
+    for i in range(wait_time, 0, -1):
+        print(f"等待中: {i}秒", end="\r")
+        time.sleep(1)
+    print()
+
+    # 步骤5: B一分钟后重新上线（这里缩短为30秒以加快测试）
+    print("\n步骤5: B重新上线...")
+    client_b = TCPTestClient()
+    if client_b.connect():
+        # B使用相同的UUID重新认证
+        print(f"B使用UUID: {user_b_uuid}重新认证...")
+        auth_response_b = client_b.authenticate(user_b_uuid)
+        if auth_response_b and '"code":"0000"' in auth_response_b:
+            print("✓ B重新上线并认证成功")
+            
+            # B尝试接收离线期间的消息
+            print("\nB尝试接收离线期间的消息...")
+            time.sleep(2)  # 等待服务器处理
+            
+            # 循环接收可能的多条消息
+            received_messages = []
+            for _ in range(5):  # 最多尝试接收5次
+                response = client_b.receive_message(timeout=2)
+                if response and '"op":"Message"' in response:
+                    received_messages.append(response)
+                elif not response:
+                    break
+            
+            if received_messages:
+                print(f"✓ B成功收到{len(received_messages)}条离线消息:")
+                for msg in received_messages:
+                    print(f"  - {msg}")
+            else:
+                print("✗ B未收到离线消息")
+        else:
+            print("✗ B重新认证失败")
+    else:
+        print("✗ B重新连接失败")
+
+    # 步骤6: 断开所有连接
+    print("\n步骤6: 断开所有连接...")
+    if client_a.connected:
+        client_a.disconnect()
+    if client_b.connected:
+        client_b.disconnect()
+
+    print("\n=== 离线消息转发测试完成 ===")
 
 def interactive_test():
     """交互式测试"""
@@ -335,11 +485,12 @@ if __name__ == "__main__":
         print("2. 测试正常流程")
         print("3. 测试多客户端")
         print("4. 测试消息转发")
-        print("5. 交互式测试")
-        print("6. 运行所有测试")
+        print("5. 测试接收方临时不在线的消息转发")
+        print("6. 交互式测试")
+        print("7. 运行所有测试")
         print("0. 退出")
 
-        choice = input("请输入选择 (0-6): ").strip()
+        choice = input("请输入选择 (0-7): ").strip()
 
         if choice == '1':
             test_authentication_required()
@@ -350,12 +501,15 @@ if __name__ == "__main__":
         elif choice == '4':
             test_message_forwarding()
         elif choice == '5':
-            interactive_test()
+            test_offline_message_forwarding()
         elif choice == '6':
+            interactive_test()
+        elif choice == '7':
             test_authentication_required()
             test_normal_flow()
             test_multiple_clients()
             test_message_forwarding()
+            test_offline_message_forwarding()
             print("\n所有测试完成！")
         elif choice == '0':
             print("退出测试")

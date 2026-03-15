@@ -1,2 +1,8 @@
 .idea
 .DS_Store
+.venv
+
+remochi
+remochi.exe
+remochi.out
+remochi.a
